@@ -1,0 +1,1425 @@
+//+------------------------------------------------------------------+
+//|               XMT-Scalper MT5 REAL v1.17a (PAYOFF-FIX)           |
+//|  Base: v1.17 (PAYOFF-UPGRADE)                                    |
+//|  Objetivo: NO tocar entradas / mejorar payoff real               |
+//|                                                                  |
+//|  FIX v1.17a:                                                     |
+//|  - Trailing vuelve a escala REAL (evita step gigante)            |
+//|  - Trailing en 2 etapas: primero BLOQUEA profit, luego deja correr|
+//|  - Step clamp (min/max) para que ATR/params no “rompan” trailing |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.17"
+
+#include <Trade/Trade.mqh>
+
+//--- CONFIGURACIÓN GENERAL
+input bool     ReverseTrade = false;
+input int      Magic = 246001;
+input bool     Debug = false;
+input bool     Verbose = true;
+
+//--- CONDICIONES DE TRADING
+input double   MaxSpreadPoints = 300.0;
+input int      SlippagePoints = 30;
+input double   StopLossPoints = 60;
+input double   TakeProfitPoints = 500;
+input double   AddPriceGapPoints = 20;
+
+//--- TRAILING STOP (robustez REAL)
+//  IMPORTANT: en v1.17 original TrailingStepPoints=430 era demasiado grande.
+//  Aquí volvemos a escala tipo v1.16 para que el trailing SÍ proteja.
+input double   TrailingStartPoints = 80;   // antes 60
+input double   TrailingStepPoints  = 40;   // antes 430  (FIX CLAVE)
+input double   TrailingStartFactor = 2.8;
+input double   TrailingStepFactor  = 2.2;
+
+//--- COSTES Y REGLAS DEL BROKER
+input double   CommissionPerLot = 2;
+input double   MinimumUseStopLevelPoints = 0;
+input int      OrderExpireSeconds = 3600;
+input int      MaxOpenTrades = 1;
+
+//--- VOLATILIDAD / SENSIBILIDAD
+input bool     UseDynamicVolatilityLimit = true;
+input double   VolatilityMultiplier = 225;
+input double   VolatilityLimitPoints = 350;
+input bool     UseVolatilityPercentage = true;
+input double   VolatilityPercentageLimit = 10;
+input double   MinChannelDistancePoints = 50;
+
+//--- INDICADORES DE CANAL
+input int      UseIndicatorSwitch = 1; // 1=MA, 2=BB, 3=Env
+input int      IndicatorPeriod = 3;
+input double   BBDeviation = 2.0;
+input double   EnvelopesDeviation = 0.07;
+
+//--- MONEY MANAGEMENT
+input bool     MoneyManagement = true;
+input double   MinLots = 0.01;
+input double   MaxLots = 100.0;
+input double   RiskPercent = 2.0;
+input double   ManualLots = 0.10;
+input double   MinMarginLevelPercent = 100;
+
+//--- LOGS Y VISUALIZACIÓN
+input bool     LogOnlyOnChange = true;
+
+//--- CONTROL DE FRECUENCIA (ANTI-SPAM)
+input int      MinSecondsBetweenOrderModify = 3;
+input int      MinSecondsBetweenPositionModify = 3;
+
+//--- MEDIA DE SPREAD
+input int      SpreadAvgPeriod = 10;
+
+//--- SEGURIDAD REAL
+input double   SafetyBufferPoints = 10;
+input double   MinModifyDeltaPoints = 20;
+input int      TicketCooldownOnErrorSec = 10;
+input bool     PendingDynamicLegal = true;
+
+//--- Anti-whipsaw / Anti-flip
+input int      AntiFlipBlockSeconds = 120;
+input int      ConfirmCloseBars = 1;
+input int      GlobalCooldownOnErrorsSec = 60;
+input int      MaxConsecutiveTradeErrors = 3;
+
+//--- REAL EXECUTION (anti-invalid price)
+input int      PendingSendMaxRetries = 3;
+input double   RetryExtraGapPoints = 8;
+input int      MinSecondsAfterPlaceNoModify = 2;
+input double   WeakEntryLotFactor = 0.70;
+
+//--- NUEVO: CONTROL REAL PARA CORTAR PATRÓN PERDEDOR (v1.16)
+input double   ArmDistancePoints = 80;            // si la pendiente está a <= esto del mercado => "ARMED" (no modificar)
+input int      ArmFreezeSeconds  = 15;            // tiempo mínimo congelado una vez armada
+input int      MaxPendingModifiesPerTicket = 4;   // máximo modifies por pendiente (evita chasing infinito)
+input int      PerTicketMinModifySeconds = 6;     // throttle por ticket (más real que global)
+input int      FrozenCooldownSec = 20;            // cooldown más duro si el broker responde "frozen/close-to-market"
+
+//--------------------------
+// PAYOFF CONTROL (ATR + trailing adaptativo)
+//--------------------------
+input bool     UseATRPayoffControl = true;
+input int      ATRPeriod = 14;
+
+// Early Exit: cortar negativos antes (dinámico)
+input double   EarlyExitLossATRFactor = 0.55;
+input double   MinEarlyExitPoints     = 120;   // piso mínimo para no cerrar por ruido
+input int      EarlyExitMinSeconds    = 20;    // evita cerrar “al tick” por spread
+
+// Trailing adaptativo por fuerza del movimiento (ATR)
+input double   StrongMoveATRFactor    = 1.6;
+input double   StrongTrailMultiplier  = 1.35;  // >1 = más amplio (mejor para runners)
+input double   WeakTrailMultiplier    = 0.90;  // <1 = un poco más apretado
+
+// --- NUEVO v1.17a: “2 etapas” para mejorar payoff real
+// Etapa 1: al empezar trailing, primero asegura beneficio mínimo (lock) + BE buffer
+// Etapa 2: luego sigue trailing normal/adaptativo
+input double   BreakEvenBufferPoints  = 12;    // buffer para BE (en puntos)
+input double   LockProfitATRFactor    = 0.35;  // lock = max(MinLockProfitPoints, ATR*factor)
+input double   MinLockProfitPoints    = 80;    // piso lock (evita cerrar por ruido)
+input double   TrailMinStepPoints     = 60;    // clamp mínimo del step final (en puntos)
+input double   TrailMaxStepPoints     = 250;   // clamp máximo del step final (en puntos)
+//--------------------------
+
+
+CTrade  trade;
+
+double  g_Point;
+int     g_Digits;
+
+double  g_StopLevelPoints      = 0.0;
+double  g_FreezeLevelPoints    = 0.0;
+
+double  g_CommissionPoints       = 0.0;
+double  g_VolatilityMultiplier   = 0.0;
+double  g_VolatilityPercentLimit = 0.0;
+
+int     g_handleMA_low  = INVALID_HANDLE;
+int     g_handleMA_high = INVALID_HANDLE;
+int     g_handleBands   = INVALID_HANDLE;
+int     g_handleEnv     = INVALID_HANDLE;
+
+int     g_handleATR     = INVALID_HANDLE;
+
+#define SPREAD_BUF_SIZE 60
+double  g_SpreadArray[SPREAD_BUF_SIZE];
+int     g_SpreadCount = 0;
+
+string  g_LastPrintMsg   = "";
+string  g_LastCommentMsg = "";
+
+int     g_OpenPositionsCount = 0;
+int     g_OpenPendingCount   = 0;
+double  g_OpenLots           = 0.0;
+double  g_OpenProfit         = 0.0;
+
+datetime g_LastOrderModifyTime    = 0;
+datetime g_LastPositionModifyTime = 0;
+datetime g_LastPendingPlaceTime   = 0;
+
+bool     g_SpreadBlocked          = false;
+
+double   g_TickSize = 0.0;
+
+#define COOLDOWN_MAX 96
+ulong    g_CooldownTicket[COOLDOWN_MAX];
+datetime g_CooldownUntil[COOLDOWN_MAX];
+
+int      g_LastClosedDirection = 0;
+datetime g_LastClosedTime      = 0;
+
+datetime g_GlobalCooldownUntil = 0;
+int      g_ConsecutiveErrors   = 0;
+
+double   g_EntryConfidence = 1.0;
+
+#define TRAIL_MAX 96
+ulong    g_TrailTicket[TRAIL_MAX];
+double   g_TrailLastPrice[TRAIL_MAX];
+
+#define PEND_MAX 128
+ulong    g_PendTicket[PEND_MAX];
+datetime g_PendPlacedAt[PEND_MAX];
+datetime g_PendLastModAt[PEND_MAX];
+int      g_PendModCount[PEND_MAX];
+datetime g_PendArmedUntil[PEND_MAX];
+
+//------------------------------------------------------------------
+// ANTI-SPAM PRINT/COMMENT
+//------------------------------------------------------------------
+void PrintOnce(const string &txt)
+{
+   if(!LogOnlyOnChange || txt != g_LastPrintMsg)
+   {
+      g_LastPrintMsg = txt;
+      if(Debug || Verbose) Print(txt);
+   }
+}
+void CommentOnce(const string &txt)
+{
+   if(!LogOnlyOnChange || txt != g_LastCommentMsg)
+   {
+      g_LastCommentMsg = txt;
+      Comment(txt);
+   }
+}
+
+//------------------------------------------------------------------
+// UTILIDADES
+//------------------------------------------------------------------
+double NormalizePriceDigits(const double price){ return NormalizeDouble(price,_Digits); }
+
+double RoundToTick(const double price)
+{
+   if(g_TickSize <= 0.0) return NormalizePriceDigits(price);
+   double k = MathRound(price / g_TickSize) * g_TickSize;
+   return NormalizePriceDigits(k);
+}
+
+double UpdateAndGetAvgSpread(double spread)
+{
+   int maxBuf = ArraySize(g_SpreadArray);
+   for(int i=0; i<maxBuf-1; i++)
+      g_SpreadArray[i] = g_SpreadArray[i+1];
+
+   g_SpreadArray[maxBuf-1] = spread;
+   if(g_SpreadCount < maxBuf) g_SpreadCount++;
+
+   if(g_SpreadCount <= 1) return spread;
+
+   int n = SpreadAvgPeriod;
+   if(n < 1) n = 1;
+   if(n > maxBuf) n = maxBuf;
+   if(n > g_SpreadCount) n = g_SpreadCount;
+   if(n <= 1) return spread;
+
+   double sum = 0.0;
+   for(int i=maxBuf-n; i<maxBuf; i++)
+      sum += g_SpreadArray[i];
+
+   return sum / n;
+}
+
+double MinLegalMarketDistancePoints()
+{
+   double base = MathMax(g_StopLevelPoints, g_FreezeLevelPoints);
+   return (base + SafetyBufferPoints);
+}
+
+bool IsTooCloseToMarket(double price, double bid, double ask)
+{
+   double nearest = (MathAbs(price-bid) < MathAbs(price-ask) ? bid : ask);
+   double distPts = MathAbs(price-nearest)/g_Point;
+   return (distPts < MinLegalMarketDistancePoints());
+}
+
+double DistanceToMarketPoints(double price, double bid, double ask)
+{
+   double nearest = (MathAbs(price-bid) < MathAbs(price-ask) ? bid : ask);
+   return MathAbs(price-nearest)/g_Point;
+}
+
+double ClampDouble(double v, double lo, double hi)
+{
+   if(v < lo) return lo;
+   if(v > hi) return hi;
+   return v;
+}
+
+//------------------------------------------------------------------
+// COOLDOWN MAP
+//------------------------------------------------------------------
+int FindCooldownSlot(ulong ticket)
+{
+   for(int i=0;i<COOLDOWN_MAX;i++)
+      if(g_CooldownTicket[i]==ticket) return i;
+   return -1;
+}
+int GetFreeCooldownSlot()
+{
+   for(int i=0;i<COOLDOWN_MAX;i++)
+      if(g_CooldownTicket[i]==0) return i;
+   return (int)(TimeLocal() % COOLDOWN_MAX);
+}
+bool IsTicketOnCooldown(ulong ticket)
+{
+   int idx = FindCooldownSlot(ticket);
+   if(idx<0) return false;
+   return (TimeCurrent() < g_CooldownUntil[idx]);
+}
+void SetTicketCooldown(ulong ticket, int seconds)
+{
+   int idx = FindCooldownSlot(ticket);
+   if(idx<0) idx = GetFreeCooldownSlot();
+   g_CooldownTicket[idx] = ticket;
+   g_CooldownUntil[idx]  = TimeCurrent() + seconds;
+}
+
+//------------------------------------------------------------------
+// COOLDOWN GLOBAL
+//------------------------------------------------------------------
+bool IsGlobalCooldown(){ return (TimeCurrent() < g_GlobalCooldownUntil); }
+
+void AddTradeErrorCooldown(const string &reason)
+{
+   g_ConsecutiveErrors++;
+   if(g_ConsecutiveErrors >= MaxConsecutiveTradeErrors)
+   {
+      g_GlobalCooldownUntil = TimeCurrent() + GlobalCooldownOnErrorsSec;
+      PrintOnce(StringFormat("GLOBAL COOLDOWN %ds por errores consecutivos (%d). Motivo: %s",
+                             GlobalCooldownOnErrorsSec, g_ConsecutiveErrors, reason));
+      g_ConsecutiveErrors = 0;
+   }
+}
+
+//------------------------------------------------------------------
+// TRAILING MAP (por ticket)
+//------------------------------------------------------------------
+int FindTrailSlot(ulong ticket)
+{
+   for(int i=0;i<TRAIL_MAX;i++)
+      if(g_TrailTicket[i]==ticket) return i;
+   return -1;
+}
+int GetFreeTrailSlot()
+{
+   for(int i=0;i<TRAIL_MAX;i++)
+      if(g_TrailTicket[i]==0) return i;
+   return (int)(TimeLocal() % TRAIL_MAX);
+}
+double GetTrailLastPrice(ulong ticket)
+{
+   int idx = FindTrailSlot(ticket);
+   if(idx<0) return 0.0;
+   return g_TrailLastPrice[idx];
+}
+void SetTrailLastPrice(ulong ticket, double px)
+{
+   int idx = FindTrailSlot(ticket);
+   if(idx<0) idx = GetFreeTrailSlot();
+   g_TrailTicket[idx] = ticket;
+   g_TrailLastPrice[idx] = px;
+}
+
+//------------------------------------------------------------------
+// PENDING MAP (por ticket)
+//------------------------------------------------------------------
+int FindPendSlot(ulong ticket)
+{
+   for(int i=0;i<PEND_MAX;i++)
+      if(g_PendTicket[i]==ticket) return i;
+   return -1;
+}
+int GetFreePendSlot()
+{
+   for(int i=0;i<PEND_MAX;i++)
+      if(g_PendTicket[i]==0) return i;
+   return (int)(TimeLocal() % PEND_MAX);
+}
+void TrackPendEnsure(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx >= 0) return;
+
+   idx = GetFreePendSlot();
+   g_PendTicket[idx]     = ticket;
+   g_PendPlacedAt[idx]   = TimeCurrent();
+   g_PendLastModAt[idx]  = 0;
+   g_PendModCount[idx]   = 0;
+   g_PendArmedUntil[idx] = 0;
+}
+void TrackPendResetIfMissing(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx < 0) return;
+   g_PendTicket[idx] = 0;
+   g_PendPlacedAt[idx] = 0;
+   g_PendLastModAt[idx] = 0;
+   g_PendModCount[idx] = 0;
+   g_PendArmedUntil[idx] = 0;
+}
+datetime PendLastModAt(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx<0) return 0;
+   return g_PendLastModAt[idx];
+}
+int PendModCount(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx<0) return 0;
+   return g_PendModCount[idx];
+}
+datetime PendArmedUntil(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx<0) return 0;
+   return g_PendArmedUntil[idx];
+}
+void PendSetLastMod(ulong ticket)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx<0) return;
+   g_PendLastModAt[idx] = TimeCurrent();
+   g_PendModCount[idx]  = MathMin(999, g_PendModCount[idx] + 1);
+}
+void PendSetArmed(ulong ticket, int sec)
+{
+   int idx = FindPendSlot(ticket);
+   if(idx<0) return;
+   datetime until = TimeCurrent() + sec;
+   if(until > g_PendArmedUntil[idx]) g_PendArmedUntil[idx] = until;
+}
+
+//------------------------------------------------------------------
+// RECUENTO POSICIONES Y PENDIENTES
+//------------------------------------------------------------------
+void RecountPositions()
+{
+   g_OpenPositionsCount = 0;
+   g_OpenPendingCount   = 0;
+   g_OpenLots           = 0.0;
+   g_OpenProfit         = 0.0;
+
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (int)PositionGetInteger(POSITION_MAGIC) == Magic)
+      {
+         g_OpenPositionsCount++;
+         g_OpenLots   += PositionGetDouble(POSITION_VOLUME);
+         g_OpenProfit += PositionGetDouble(POSITION_PROFIT)
+                       + PositionGetDouble(POSITION_SWAP);
+      }
+   }
+
+   for(int i=0; i<OrdersTotal(); i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket)) continue;
+
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (int)OrderGetInteger(ORDER_MAGIC) == Magic)
+      {
+         ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         ENUM_ORDER_STATE s= (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+
+         if((t==ORDER_TYPE_BUY_STOP || t==ORDER_TYPE_SELL_STOP) &&
+            (s==ORDER_STATE_PLACED || s==ORDER_STATE_PARTIAL))
+         {
+            g_OpenPendingCount++;
+            g_OpenLots += OrderGetDouble(ORDER_VOLUME_CURRENT);
+            TrackPendEnsure(ticket);
+         }
+      }
+   }
+}
+
+//------------------------------------------------------------------
+// LOT
+//------------------------------------------------------------------
+double CalculateLotSize(double confidence)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), MaxLots);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0.0) return minLot;
+
+   double lot = ManualLots;
+
+   if(MoneyManagement)
+   {
+      double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+      double slPoints = StopLossPoints + AddPriceGapPoints;
+      if(slPoints <= 0.0) slPoints = 1.0;
+
+      double oneLotLoss = (slPoints * g_Point / tickSize) * tickValue;
+      if(oneLotLoss <= 0.0) oneLotLoss = 1.0;
+
+      double riskMoney = equity * RiskPercent / 100.0;
+      lot = riskMoney / oneLotLoss;
+   }
+
+   double f = (confidence < 1.0 ? WeakEntryLotFactor : 1.0);
+   lot *= f;
+
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot / stepLot) * stepLot;
+   if(lot < minLot) lot = minLot;
+   return lot;
+}
+
+//------------------------------------------------------------------
+// PREPARADORES (REAL)
+//------------------------------------------------------------------
+bool PreparePendingOrder(ENUM_ORDER_TYPE type, double &price,double &sl,double &tp, double bid,double ask)
+{
+   price = RoundToTick(price);
+   if(sl > 0.0) sl = RoundToTick(sl);
+   if(tp > 0.0) tp = RoundToTick(tp);
+
+   if(IsTooCloseToMarket(price,bid,ask))
+      return false;
+
+   double minStopDist = MathMax(g_StopLevelPoints, 1.0) * g_Point;
+
+   if(type == ORDER_TYPE_BUY_STOP)
+   {
+      if(sl>0.0 && (price - sl) < minStopDist) sl = RoundToTick(price - minStopDist);
+      if(tp>0.0 && (tp - price) < minStopDist) tp = RoundToTick(price + minStopDist);
+   }
+   else if(type == ORDER_TYPE_SELL_STOP)
+   {
+      if(sl>0.0 && (sl - price) < minStopDist) sl = RoundToTick(price + minStopDist);
+      if(tp>0.0 && (price - tp) < minStopDist) tp = RoundToTick(price - minStopDist);
+   }
+
+   if(sl>0.0 && IsTooCloseToMarket(sl,bid,ask)) return false;
+   if(tp>0.0 && IsTooCloseToMarket(tp,bid,ask)) return false;
+
+   return true;
+}
+
+bool PreparePositionStops(ENUM_POSITION_TYPE type, double &sl,double &tp, double bid,double ask)
+{
+   double minStopDistPts = MathMax(g_StopLevelPoints, 1.0);
+   double freezePts      = g_FreezeLevelPoints;
+   double safePts        = MinLegalMarketDistancePoints();
+
+   if(type == POSITION_TYPE_BUY)
+   {
+      if(sl > 0.0)
+      {
+         double distPts = (bid - sl)/g_Point;
+         if(distPts < minStopDistPts) sl = bid - minStopDistPts*g_Point;
+         if(distPts < freezePts || distPts < safePts) return false;
+      }
+      if(tp > 0.0)
+      {
+         double distPts = (tp - bid)/g_Point;
+         if(distPts < minStopDistPts) tp = bid + minStopDistPts*g_Point;
+         if(distPts < freezePts || distPts < safePts) return false;
+      }
+   }
+   else if(type == POSITION_TYPE_SELL)
+   {
+      if(sl > 0.0)
+      {
+         double distPts = (sl - ask)/g_Point;
+         if(distPts < minStopDistPts) sl = ask + minStopDistPts*g_Point;
+         if(distPts < freezePts || distPts < safePts) return false;
+      }
+      if(tp > 0.0)
+      {
+         double distPts = (ask - tp)/g_Point;
+         if(distPts < minStopDistPts) tp = ask - minStopDistPts*g_Point;
+         if(distPts < freezePts || distPts < safePts) return false;
+      }
+   }
+
+   if(sl > 0.0) sl = RoundToTick(sl);
+   if(tp > 0.0) tp = RoundToTick(tp);
+   return true;
+}
+
+//------------------------------------------------------------------
+// INDICADORES
+//------------------------------------------------------------------
+bool GetIndicatorChannel(double bid, double &highest, double &lowest, bool &isBidGreater)
+{
+   double up[1], low[1];
+
+   if(UseIndicatorSwitch == 1)
+   {
+      double loArr[1], hiArr[1];
+      if(CopyBuffer(g_handleMA_low,  0, 0, 1, loArr) <= 0)  return false;
+      if(CopyBuffer(g_handleMA_high, 0, 0, 1, hiArr) <= 0)  return false;
+      lowest  = loArr[0];
+      highest = hiArr[0];
+   }
+   else if(UseIndicatorSwitch == 2)
+   {
+      if(CopyBuffer(g_handleBands, 1, 0, 1, up)  <= 0) return false;
+      if(CopyBuffer(g_handleBands, 2, 0, 1, low) <= 0) return false;
+      highest = up[0];
+      lowest  = low[0];
+   }
+   else if(UseIndicatorSwitch == 3)
+   {
+      if(CopyBuffer(g_handleEnv, 0, 0, 1, up)  <= 0) return false;
+      if(CopyBuffer(g_handleEnv, 1, 0, 1, low) <= 0) return false;
+      highest = up[0];
+      lowest  = low[0];
+   }
+   else return false;
+
+   double mid = lowest + (highest - lowest)/2.0;
+   isBidGreater = (bid >= mid);
+   return true;
+}
+
+bool ConfirmBreakoutByClose(int direction, double highest, double lowest)
+{
+   int bars = (ConfirmCloseBars < 1 ? 1 : ConfirmCloseBars);
+   if(iBars(_Symbol, PERIOD_M1) < bars+2) return false;
+
+   for(int k=1; k<=bars; k++)
+   {
+      double c = iClose(_Symbol, PERIOD_M1, k);
+
+      if(direction == -1)
+      {
+         if(c > lowest) return false;
+      }
+      else if(direction == 1)
+      {
+         if(c < highest) return false;
+      }
+   }
+   return true;
+}
+
+int ComputeDirection(double bid, double highest, double lowest, double volatility, double volLimit)
+{
+   int direction = 0;
+
+   if(volatility > volLimit)
+   {
+      double perc = volatility / volLimit;
+
+      if(!UseVolatilityPercentage || perc > g_VolatilityPercentLimit)
+      {
+         double distBelow = (lowest - bid)  / g_Point;
+         double distAbove = (bid - highest) / g_Point;
+
+         if(distBelow > MinChannelDistancePoints)
+            direction = -1; // BUY_STOP
+         else if(distAbove > MinChannelDistancePoints)
+            direction = 1;  // SELL_STOP
+
+         if(ReverseTrade) direction = -direction;
+      }
+   }
+   return direction;
+}
+
+//------------------------------------------------------------------
+// EJECUCIÓN REAL: envío de pendientes con retry
+//------------------------------------------------------------------
+bool SendPendingWithRetry(ENUM_ORDER_TYPE type,
+                          double lot,
+                          ENUM_ORDER_TYPE_TIME tt,
+                          datetime exp,
+                          int directionForLogs)
+{
+   int maxRetries = (PendingSendMaxRetries < 1 ? 1 : PendingSendMaxRetries);
+
+   for(int r=0; r<maxRetries; r++)
+   {
+      MqlTick tick;
+      if(!SymbolInfoTick(_Symbol, tick)) return false;
+
+      double ask = tick.ask;
+      double bid = tick.bid;
+      double spread = ask - bid;
+
+      double extra = (r==0 ? 0.0 : (RetryExtraGapPoints * r) * g_Point);
+
+      double p=0, s=0, t=0;
+
+      if(type == ORDER_TYPE_BUY_STOP)
+      {
+         p = ask + (MinLegalMarketDistancePoints()*g_Point) + AddPriceGapPoints*g_Point + extra;
+         s = p - spread - StopLossPoints*g_Point - AddPriceGapPoints*g_Point;
+         t = p + TakeProfitPoints*g_Point + AddPriceGapPoints*g_Point;
+      }
+      else if(type == ORDER_TYPE_SELL_STOP)
+      {
+         p = bid - (MinLegalMarketDistancePoints()*g_Point) - AddPriceGapPoints*g_Point - extra;
+         s = p + spread + StopLossPoints*g_Point + AddPriceGapPoints*g_Point;
+         t = p - TakeProfitPoints*g_Point - AddPriceGapPoints*g_Point;
+      }
+      else return false;
+
+      if(!PreparePendingOrder(type, p, s, t, bid, ask))
+      {
+         if(Debug) PrintOnce(StringFormat("Retry[%d/%d] PreparePendingOrder NO legal (dir=%d).", r+1,maxRetries,directionForLogs));
+         continue;
+      }
+
+      bool ok=false;
+      if(type == ORDER_TYPE_BUY_STOP)
+         ok = trade.BuyStop(lot, RoundToTick(p), _Symbol, RoundToTick(s), RoundToTick(t), tt, exp);
+      else
+         ok = trade.SellStop(lot, RoundToTick(p), _Symbol, RoundToTick(s), RoundToTick(t), tt, exp);
+
+      if(ok)
+      {
+         g_LastPendingPlaceTime = TimeCurrent();
+         g_ConsecutiveErrors = 0;
+
+         ulong lastOrd = trade.ResultOrder();
+         if(lastOrd > 0) TrackPendEnsure(lastOrd);
+
+         if(Debug || Verbose)
+            PrintOnce(StringFormat("Pending OK retry=%d dir=%d lot=%.2f p=%.5f sl=%.5f tp=%.5f",
+                                   r, directionForLogs, lot, p, s, t));
+         return true;
+      }
+      else
+      {
+         AddTradeErrorCooldown(StringFormat("Pending send fail retry=%d dir=%d", r, directionForLogs));
+      }
+   }
+   return false;
+}
+
+//------------------------------------------------------------------
+// ATR en puntos
+//------------------------------------------------------------------
+double GetATRPoints()
+{
+   if(!UseATRPayoffControl) return 0.0;
+   if(g_handleATR == INVALID_HANDLE) return 0.0;
+
+   double atrArr[1];
+   if(CopyBuffer(g_handleATR, 0, 0, 1, atrArr) <= 0) return 0.0;
+
+   double atr = atrArr[0];
+   if(atr <= 0.0) return 0.0;
+   return (atr / g_Point);
+}
+
+//------------------------------------------------------------------
+// Early Exit para trades negativos
+//------------------------------------------------------------------
+void ManageEarlyExit(double ask, double bid, double atrPts)
+{
+   if(!UseATRPayoffControl) return;
+   if(atrPts <= 0.0) return;
+
+   datetime now = TimeCurrent();
+   double thrPts = MathMax(MinEarlyExitPoints, EarlyExitLossATRFactor * atrPts);
+
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         (int)PositionGetInteger(POSITION_MAGIC) != Magic)
+         continue;
+
+      if(IsTicketOnCooldown(ticket))
+         continue;
+
+      datetime posTime = (datetime)PositionGetInteger(POSITION_TIME);
+      if(EarlyExitMinSeconds > 0 && (now - posTime) < EarlyExitMinSeconds)
+         continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+      if(profit >= 0.0) continue;
+
+      double adversePts = 0.0;
+      if(type == POSITION_TYPE_BUY)
+         adversePts = (open - bid) / g_Point;
+      else if(type == POSITION_TYPE_SELL)
+         adversePts = (ask - open) / g_Point;
+      else
+         continue;
+
+      if(adversePts >= thrPts)
+      {
+         bool ok = trade.PositionClose(ticket);
+         if(ok)
+         {
+            PrintOnce(StringFormat("EARLY EXIT: ticket=%I64u adverse=%.1fpts thr=%.1fpts (ATR=%.1fpts)",
+                                   ticket, adversePts, thrPts, atrPts));
+            SetTicketCooldown(ticket, TicketCooldownOnErrorSec);
+         }
+         else
+         {
+            SetTicketCooldown(ticket, TicketCooldownOnErrorSec);
+            AddTradeErrorCooldown("EarlyExit PositionClose fail");
+         }
+      }
+   }
+}
+
+//------------------------------------------------------------------
+// TRAILING (2 etapas) - FIX PAYOFF
+//------------------------------------------------------------------
+void ManageTrailing(double atrPts)
+{
+   if(TrailingStartPoints <= 0.0 || TrailingStepPoints <= 0.0)
+      return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double ask = tick.ask;
+   double bid = tick.bid;
+   datetime now = TimeCurrent();
+
+   double baseStartPts = TrailingStartPoints * (TrailingStartFactor <= 0.0 ? 1.0 : TrailingStartFactor);
+   double baseStepPts  = TrailingStepPoints  * (TrailingStepFactor  <= 0.0 ? 1.0 : TrailingStepFactor);
+
+   // lock profit dinámico (Etapa 1)
+   double lockPts = MinLockProfitPoints;
+   if(UseATRPayoffControl && atrPts > 0.0)
+      lockPts = MathMax(MinLockProfitPoints, LockProfitATRFactor * atrPts);
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         (int)PositionGetInteger(POSITION_MAGIC) != Magic)
+         continue;
+
+      if(IsTicketOnCooldown(ticket))
+         continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double tp   = PositionGetDouble(POSITION_TP);
+
+      double lastTrail = GetTrailLastPrice(ticket);
+
+      // fuerza (ATR)
+      bool strong = false;
+      double profitPtsNow = 0.0;
+      if(type == POSITION_TYPE_BUY)  profitPtsNow = (bid - open) / g_Point;
+      if(type == POSITION_TYPE_SELL) profitPtsNow = (open - ask) / g_Point;
+
+      if(UseATRPayoffControl && atrPts > 0.0)
+      {
+         if(profitPtsNow >= (StrongMoveATRFactor * atrPts))
+            strong = true;
+      }
+
+      // step adaptativo + CLAMP (FIX)
+      double rawStepPts = baseStepPts * (strong ? StrongTrailMultiplier : WeakTrailMultiplier);
+      double stepPts    = ClampDouble(rawStepPts,
+                                      (TrailMinStepPoints > 1 ? TrailMinStepPoints : 1),
+                                      (TrailMaxStepPoints > 1 ? TrailMaxStepPoints : rawStepPts));
+
+      double startPts = baseStartPts;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         if(profitPtsNow <= startPts) continue;
+
+         // Etapa 1: asegurar BE+buffer y lock mínimo si ya hay espacio
+         double beSL   = open + BreakEvenBufferPoints * g_Point;
+         double lockSL = open + lockPts * g_Point;
+
+         // Etapa 2: trailing normal
+         double trailSL = bid - stepPts * g_Point;
+
+         // tomamos el MÁS alto (más protector)
+         double newSL = trailSL;
+         if(profitPtsNow >= (BreakEvenBufferPoints + 5)) newSL = MathMax(newSL, beSL);
+         if(profitPtsNow >= (lockPts + 5))              newSL = MathMax(newSL, lockSL);
+
+         newSL = RoundToTick(newSL);
+
+         // filtros anti-spam / micro cambios
+         if(sl > 0.0 && (newSL - sl) / g_Point < (MathMax(stepPts * 0.75, 20.0))) continue;
+         if(lastTrail != 0.0 && (bid - lastTrail) / g_Point < MathMax(stepPts * 1.25, 25.0)) continue;
+
+         double tmpSL = newSL;
+         double tmpTP = tp;
+
+         if(!PreparePositionStops(type, tmpSL, tmpTP, bid, ask)) continue;
+         if(now - g_LastPositionModifyTime < MinSecondsBetweenPositionModify) continue;
+
+         if(trade.PositionModify(_Symbol, tmpSL, tmpTP))
+         {
+            g_LastPositionModifyTime = now;
+            SetTrailLastPrice(ticket, bid);
+         }
+         else
+         {
+            SetTicketCooldown(ticket, TicketCooldownOnErrorSec);
+            AddTradeErrorCooldown("PositionModify BUY trailing fail");
+         }
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         if(profitPtsNow <= startPts) continue;
+
+         double beSL   = open - BreakEvenBufferPoints * g_Point;
+         double lockSL = open - lockPts * g_Point;
+
+         double trailSL = ask + stepPts * g_Point;
+
+         double newSL = trailSL;
+         if(profitPtsNow >= (BreakEvenBufferPoints + 5)) newSL = MathMin(newSL, beSL);
+         if(profitPtsNow >= (lockPts + 5))              newSL = MathMin(newSL, lockSL);
+
+         newSL = RoundToTick(newSL);
+
+         if(sl > 0.0 && (sl - newSL) / g_Point < (MathMax(stepPts * 0.75, 20.0))) continue;
+         if(lastTrail != 0.0 && (lastTrail - ask) / g_Point < MathMax(stepPts * 1.25, 25.0)) continue;
+
+         double tmpSL = newSL;
+         double tmpTP = tp;
+
+         if(!PreparePositionStops(type, tmpSL, tmpTP, bid, ask)) continue;
+         if(now - g_LastPositionModifyTime < MinSecondsBetweenPositionModify) continue;
+
+         if(trade.PositionModify(_Symbol, tmpSL, tmpTP))
+         {
+            g_LastPositionModifyTime = now;
+            SetTrailLastPrice(ticket, ask);
+         }
+         else
+         {
+            SetTicketCooldown(ticket, TicketCooldownOnErrorSec);
+            AddTradeErrorCooldown("PositionModify SELL trailing fail");
+         }
+      }
+   }
+}
+
+//------------------------------------------------------------------
+// Control “recién puesta” (global)
+//------------------------------------------------------------------
+bool ShouldSkipModifyBecauseJustPlaced()
+{
+   if(MinSecondsAfterPlaceNoModify <= 0) return false;
+   return (TimeCurrent() - g_LastPendingPlaceTime < MinSecondsAfterPlaceNoModify);
+}
+
+//------------------------------------------------------------------
+// MANEJO DE PENDIENTES EXISTENTES (REAL) - OPTIMIZADO
+//------------------------------------------------------------------
+bool PendingShouldFreezeNow(ulong ticket, ENUM_ORDER_TYPE type, double orderPrice, double bid, double ask)
+{
+   double dist = DistanceToMarketPoints(orderPrice, bid, ask);
+
+   if(ArmDistancePoints > 0 && dist <= ArmDistancePoints)
+   {
+      if(ArmFreezeSeconds > 0) PendSetArmed(ticket, ArmFreezeSeconds);
+      return true;
+   }
+
+   datetime until = PendArmedUntil(ticket);
+   if(until > 0 && TimeCurrent() < until) return true;
+
+   return false;
+}
+
+bool IsModifyWorthIt(double oldP, double oldSL, double oldTP,
+                     double newP, double newSL, double newTP)
+{
+   double dp  = MathAbs(newP  - oldP ) / g_Point;
+   double dsl = MathAbs(newSL - oldSL) / g_Point;
+   double dtp = MathAbs(newTP - oldTP) / g_Point;
+
+   return !(dp < MinModifyDeltaPoints && dsl < MinModifyDeltaPoints && dtp < MinModifyDeltaPoints);
+}
+
+bool IsPriceImprovement(ENUM_ORDER_TYPE type, double oldP, double newP)
+{
+   if(type == ORDER_TYPE_BUY_STOP)
+      return (newP < oldP);
+   if(type == ORDER_TYPE_SELL_STOP)
+      return (newP > oldP);
+   return false;
+}
+
+void ManagePendingOrders(double ask,double bid,double spread)
+{
+   datetime now = TimeCurrent();
+
+   if(!PendingDynamicLegal) return;
+   if(ShouldSkipModifyBecauseJustPlaced()) return;
+
+   for(int i=0; i<OrdersTotal(); i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket)) continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol ||
+         (int)OrderGetInteger(ORDER_MAGIC) != Magic)
+         continue;
+
+      ENUM_ORDER_TYPE type  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      ENUM_ORDER_STATE st   = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+
+      if(type != ORDER_TYPE_BUY_STOP && type != ORDER_TYPE_SELL_STOP) continue;
+      if(st != ORDER_STATE_PLACED && st != ORDER_STATE_PARTIAL) continue;
+
+      TrackPendEnsure(ticket);
+
+      if(IsTicketOnCooldown(ticket)) continue;
+
+      datetime lastMod = PendLastModAt(ticket);
+      if(lastMod > 0 && (now - lastMod) < PerTicketMinModifySeconds) continue;
+
+      if(MaxPendingModifiesPerTicket > 0 && PendModCount(ticket) >= MaxPendingModifiesPerTicket)
+      {
+         PendSetArmed(ticket, ArmFreezeSeconds);
+         continue;
+      }
+
+      double op = OrderGetDouble(ORDER_PRICE_OPEN);
+      double sl = OrderGetDouble(ORDER_SL);
+      double tp = OrderGetDouble(ORDER_TP);
+
+      if(PendingShouldFreezeNow(ticket, type, op, bid, ask))
+         continue;
+
+      double np, nsl, ntp;
+
+      if(type == ORDER_TYPE_BUY_STOP)
+      {
+         np  = ask + (MinLegalMarketDistancePoints()*g_Point) + AddPriceGapPoints*g_Point;
+         nsl = np - spread - StopLossPoints*g_Point - AddPriceGapPoints*g_Point;
+         ntp = np + TakeProfitPoints*g_Point + AddPriceGapPoints*g_Point;
+      }
+      else
+      {
+         np  = bid - (MinLegalMarketDistancePoints()*g_Point) - AddPriceGapPoints*g_Point;
+         nsl = np + spread + StopLossPoints*g_Point + AddPriceGapPoints*g_Point;
+         ntp = np - TakeProfitPoints*g_Point - AddPriceGapPoints*g_Point;
+      }
+
+      if(!IsModifyWorthIt(op, sl, tp, np, nsl, ntp))
+         continue;
+
+      if(!IsPriceImprovement(type, op, np))
+         continue;
+
+      if(!PreparePendingOrder(type, np, nsl, ntp, bid, ask))
+         continue;
+
+      if(now - g_LastOrderModifyTime < MinSecondsBetweenOrderModify)
+         continue;
+
+      if(IsTooCloseToMarket(np, bid, ask))
+         continue;
+
+      bool ok = trade.OrderModify(ticket, np, nsl, ntp,
+                                  (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
+                                  (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION));
+      if(ok)
+      {
+         g_LastOrderModifyTime = now;
+         PendSetLastMod(ticket);
+      }
+      else
+      {
+         SetTicketCooldown(ticket, (int)MathMax((double)TicketCooldownOnErrorSec, (double)FrozenCooldownSec));
+         PendSetArmed(ticket, ArmFreezeSeconds);
+         AddTradeErrorCooldown("OrderModify fail (frozen/invalid req)");
+      }
+   }
+}
+
+//------------------------------------------------------------------
+// AntiFlip
+//------------------------------------------------------------------
+bool IsDirectionBlocked(int direction)
+{
+   if(AntiFlipBlockSeconds <= 0) return false;
+   if(g_LastClosedDirection == 0) return false;
+   if(direction == 0) return false;
+
+   if(direction != g_LastClosedDirection)
+   {
+      if(TimeCurrent() - g_LastClosedTime < AntiFlipBlockSeconds)
+         return true;
+   }
+   return false;
+}
+
+//------------------------------------------------------------------
+// COLOCAR NUEVAS PENDIENTES
+//------------------------------------------------------------------
+void PlacePendingOrders(int direction,double ask,double bid,double spread)
+{
+   if(direction == 0) return;
+
+   if(IsGlobalCooldown())
+   {
+      PrintOnce("GLOBAL COOLDOWN activo: no se colocan pendientes.");
+      return;
+   }
+   if(IsDirectionBlocked(direction))
+   {
+      PrintOnce(StringFormat("AntiFlip: bloqueada dirección %d por %ds tras cierre.", direction, AntiFlipBlockSeconds));
+      return;
+   }
+
+   datetime now = TimeCurrent();
+   if(now - g_LastPendingPlaceTime < 1) return;
+
+   ENUM_ORDER_TYPE_TIME tt = (OrderExpireSeconds > 0 ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC);
+   datetime exp = (OrderExpireSeconds > 0 ? now + OrderExpireSeconds : 0);
+
+   double lot = CalculateLotSize(g_EntryConfidence);
+
+   if(direction == -1)
+      SendPendingWithRetry(ORDER_TYPE_BUY_STOP, lot, tt, exp, -1);
+   else if(direction == 1)
+      SendPendingWithRetry(ORDER_TYPE_SELL_STOP, lot, tt, exp, 1);
+}
+
+//------------------------------------------------------------------
+// LÓGICA PRINCIPAL
+//------------------------------------------------------------------
+void TradeLogic()
+{
+   if(iBars(_Symbol,PERIOD_M1) <= IndicatorPeriod) return;
+   if(IsGlobalCooldown()) return;
+
+   double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   if(marginLevel > 0.0 && marginLevel < MinMarginLevelPercent)
+   {
+      PrintOnce(StringFormat("MarginLevel %.2f%% < %.2f%%. No trading.", marginLevel,MinMarginLevelPercent));
+      return;
+   }
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol,tick)) return;
+
+   double ask = tick.ask;
+   double bid = tick.bid;
+   double spread = ask - bid;
+
+   double avgSpread = UpdateAndGetAvgSpread(spread);
+
+   bool blockedNow = (avgSpread > MaxSpreadPoints * g_Point);
+   if(blockedNow)
+   {
+      if(!g_SpreadBlocked)
+         PrintOnce(StringFormat("Spread bloqueado: avg=%.1f pts > max=%.1f. No operar.", avgSpread/g_Point,MaxSpreadPoints));
+      g_SpreadBlocked = true;
+
+      RecountPositions();
+      CommentOnce(StringFormat("Bid %.2f | Spread %.1f | Dir=0 | Pos=%d Pend=%d",
+                               bid,avgSpread/g_Point,g_OpenPositionsCount,g_OpenPendingCount));
+      return;
+   }
+   else
+   {
+      if(g_SpreadBlocked)
+         PrintOnce(StringFormat("Spread normalizado: avg=%.1f pts <= max=%.1f. Se reanuda trading.", avgSpread/g_Point,MaxSpreadPoints));
+      g_SpreadBlocked = false;
+   }
+
+   double barHigh = iHigh(_Symbol,PERIOD_M1,0);
+   double barLow  = iLow (_Symbol,PERIOD_M1,0);
+   double volatility = barHigh - barLow;
+   if(volatility <= 0.0) return;
+
+   double highest, lowest;
+   bool isBidGreater=false;
+   if(!GetIndicatorChannel(bid,highest,lowest,isBidGreater)) return;
+
+   double volLimitBase = VolatilityLimitPoints * g_Point;
+   double volLimit     = volLimitBase;
+
+   double realSpread = avgSpread + g_CommissionPoints;
+
+   if(UseDynamicVolatilityLimit)
+   {
+      double dynLimit = realSpread * g_VolatilityMultiplier;
+      if(volLimitBase <= 0.0) volLimit = dynLimit;
+      else volLimit = MathMax(volLimitBase,dynLimit);
+   }
+   if(volLimit <= 0.0) return;
+
+   int direction = ComputeDirection(bid, highest, lowest, volatility, volLimit);
+
+   g_EntryConfidence = 1.0;
+   if(direction != 0)
+   {
+      if(!ConfirmBreakoutByClose(direction, highest, lowest))
+      {
+         g_EntryConfidence = 0.6;
+         PrintOnce(StringFormat("ConfirmClose débil Dir=%d → confidence=%.2f", direction, g_EntryConfidence));
+      }
+   }
+
+   double atrPts = GetATRPoints();
+
+   RecountPositions();
+
+   ManageEarlyExit(ask, bid, atrPts);
+   ManageTrailing(atrPts);
+
+   ManagePendingOrders(ask, bid, spread);
+
+   int totalTrades = g_OpenPositionsCount + g_OpenPendingCount;
+
+   if(direction != 0 && totalTrades < MaxOpenTrades)
+      PlacePendingOrders(direction, ask, bid, spread);
+
+   CommentOnce(StringFormat("Bid %.2f | Spread %.1f | Vol %.1f | ATR %.1f | Dir=%d | Conf=%.2f | Pos=%d Pend=%d",
+                            bid,avgSpread/g_Point,volatility/g_Point,
+                            atrPts,
+                            direction,g_EntryConfidence,
+                            g_OpenPositionsCount,g_OpenPendingCount));
+}
+
+//------------------------------------------------------------------
+// INIT
+//------------------------------------------------------------------
+int OnInit()
+{
+   g_Point  = _Point;
+   g_Digits = (int)_Digits;
+
+   long stopLevelRaw   = 0;
+   long freezeLevelRaw = 0;
+   SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL,  stopLevelRaw);
+   SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL, freezeLevelRaw);
+
+   g_StopLevelPoints   = (double)stopLevelRaw;
+   g_FreezeLevelPoints = (double)freezeLevelRaw;
+
+   if(MinimumUseStopLevelPoints > g_StopLevelPoints)
+      g_StopLevelPoints = MinimumUseStopLevelPoints;
+
+   g_TickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(g_TickSize <= 0.0) g_TickSize = _Point;
+
+   g_CommissionPoints = 0.0;
+   if(CommissionPerLot > 0.0)
+   {
+      double tickSize  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      double tickValue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      if(tickValue > 0.0 && tickSize > 0.0)
+      {
+         double pointsPerLot = CommissionPerLot / (tickValue / tickSize);
+         g_CommissionPoints  = pointsPerLot * g_Point;
+      }
+   }
+
+   g_VolatilityMultiplier   = VolatilityMultiplier / 10.0;
+   g_VolatilityPercentLimit = VolatilityPercentageLimit / 100.0 + 1.0;
+
+   ArrayInitialize(g_SpreadArray,0.0);
+   g_SpreadCount = 0;
+
+   for(int i=0;i<COOLDOWN_MAX;i++){ g_CooldownTicket[i]=0; g_CooldownUntil[i]=0; }
+   for(int i=0;i<TRAIL_MAX;i++){ g_TrailTicket[i]=0; g_TrailLastPrice[i]=0.0; }
+   for(int i=0;i<PEND_MAX;i++)
+   {
+      g_PendTicket[i]=0;
+      g_PendPlacedAt[i]=0;
+      g_PendLastModAt[i]=0;
+      g_PendModCount[i]=0;
+      g_PendArmedUntil[i]=0;
+   }
+
+   trade.SetExpertMagicNumber(Magic);
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   long fillMode = 0;
+   if(SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE, fillMode))
+      trade.SetTypeFilling((ENUM_ORDER_TYPE_FILLING)fillMode);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(UseIndicatorSwitch == 1)
+   {
+      g_handleMA_low  = iMA(_Symbol,PERIOD_M1,IndicatorPeriod,0,MODE_LWMA,PRICE_LOW);
+      g_handleMA_high = iMA(_Symbol,PERIOD_M1,IndicatorPeriod,0,MODE_LWMA,PRICE_HIGH);
+      if(g_handleMA_low == INVALID_HANDLE || g_handleMA_high == INVALID_HANDLE)
+      {
+         Print("Error creando iMA");
+         return INIT_FAILED;
+      }
+   }
+   else if(UseIndicatorSwitch == 2)
+   {
+      g_handleBands = iBands(_Symbol, PERIOD_M1, IndicatorPeriod, 0, BBDeviation, PRICE_CLOSE);
+      if(g_handleBands == INVALID_HANDLE)
+      {
+         Print("Error creando iBands");
+         return INIT_FAILED;
+      }
+   }
+   else if(UseIndicatorSwitch == 3)
+   {
+      g_handleEnv = iEnvelopes(_Symbol,PERIOD_M1,IndicatorPeriod,0,MODE_LWMA,PRICE_OPEN,EnvelopesDeviation);
+      if(g_handleEnv == INVALID_HANDLE)
+      {
+         Print("Error creando iEnvelopes");
+         return INIT_FAILED;
+      }
+   }
+   else
+   {
+      Print("UseIndicatorSwitch inválido. Usa 1=MA, 2=BB, 3=Envelopes.");
+      return INIT_FAILED;
+   }
+
+   if(UseATRPayoffControl)
+   {
+      g_handleATR = iATR(_Symbol, PERIOD_M1, ATRPeriod);
+      if(g_handleATR == INVALID_HANDLE)
+      {
+         Print("Error creando iATR (PayoffControl). Se desactiva UseATRPayoffControl.");
+      }
+   }
+
+   g_LastPrintMsg   = "";
+   g_LastCommentMsg = "";
+   g_LastOrderModifyTime    = 0;
+   g_LastPositionModifyTime = 0;
+   g_LastPendingPlaceTime   = 0;
+   g_SpreadBlocked          = false;
+
+   g_LastClosedDirection = 0;
+   g_LastClosedTime      = 0;
+   g_GlobalCooldownUntil = 0;
+   g_ConsecutiveErrors   = 0;
+
+   Print(StringFormat(
+      "XMT-Scalper MT5 REAL v1.17a iniciado en %s | Stop=%.0f Freeze=%.0f TickSize=%.5f | MinDist=%.0f pts | PendingDynamic=%s | AntiFlip=%ds | ConfirmClose=%d | Retries=%d | ARM=%.0fpts/%ds | MaxModTicket=%d | ATRPayoff=%s ATR(%d) | TrailStart=%.0f TrailStep=%.0f (clamp %.0f..%.0f) LockMin=%.0f",
+      _Symbol, g_StopLevelPoints, g_FreezeLevelPoints, g_TickSize,
+      MinLegalMarketDistancePoints(),
+      (PendingDynamicLegal?"ON":"OFF"),
+      AntiFlipBlockSeconds, ConfirmCloseBars,
+      PendingSendMaxRetries,
+      ArmDistancePoints, ArmFreezeSeconds, MaxPendingModifiesPerTicket,
+      (UseATRPayoffControl && g_handleATR!=INVALID_HANDLE ? "ON":"OFF"),
+      ATRPeriod,
+      TrailingStartPoints, TrailingStepPoints,
+      TrailMinStepPoints, TrailMaxStepPoints,
+      MinLockProfitPoints
+   ));
+
+   return INIT_SUCCEEDED;
+}
+
+//------------------------------------------------------------------
+// DEINIT
+//------------------------------------------------------------------
+void OnDeinit(const int reason)
+{
+   Comment("");
+   if(g_handleMA_low  != INVALID_HANDLE) IndicatorRelease(g_handleMA_low);
+   if(g_handleMA_high != INVALID_HANDLE) IndicatorRelease(g_handleMA_high);
+   if(g_handleBands   != INVALID_HANDLE) IndicatorRelease(g_handleBands);
+   if(g_handleEnv     != INVALID_HANDLE) IndicatorRelease(g_handleEnv);
+   if(g_handleATR     != INVALID_HANDLE) IndicatorRelease(g_handleATR);
+}
+
+//------------------------------------------------------------------
+// Captura cierres reales para AntiFlip
+//------------------------------------------------------------------
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   ulong deal = trans.deal;
+   if(deal == 0)
+      return;
+
+   if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol)
+      return;
+
+   long dealMagic = HistoryDealGetInteger(deal, DEAL_MAGIC);
+   if(dealMagic != Magic)
+      return;
+
+   ENUM_DEAL_ENTRY entry =
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+
+   if(entry != DEAL_ENTRY_OUT)
+      return;
+
+   ENUM_DEAL_TYPE dtype =
+      (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal, DEAL_TYPE);
+
+   int dir = 0;
+
+   if(dtype == DEAL_TYPE_SELL)      dir = -1; // cerró BUY
+   else if(dtype == DEAL_TYPE_BUY)  dir = 1;  // cerró SELL
+
+   if(dir != 0)
+   {
+      g_LastClosedDirection = dir;
+      g_LastClosedTime      = TimeCurrent();
+      g_ConsecutiveErrors   = 0;
+
+      PrintOnce(StringFormat("Cierre detectado (AntiFlip): dir=%d bloqueado %ds",
+                             g_LastClosedDirection, AntiFlipBlockSeconds));
+   }
+}
+
+//------------------------------------------------------------------
+// TICK
+//------------------------------------------------------------------
+void OnTick()
+{
+   TradeLogic();
+}
+//+------------------------------------------------------------------+
